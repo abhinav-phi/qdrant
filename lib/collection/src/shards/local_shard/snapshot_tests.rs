@@ -501,7 +501,7 @@ fn test_snapshot_excludes_active_proxy_pending_logs_after_concurrent_cow() {
             set_after_snapshot_proxy_flush_hook(None);
         }
     }
-    let _clear_hook = ClearHook;
+    let clear_hook = ClearHook;
 
     let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
@@ -526,17 +526,14 @@ fn test_snapshot_excludes_active_proxy_pending_logs_after_concurrent_cow() {
     )
     .unwrap();
     tar.blocking_finish().unwrap();
-    drop(_clear_hook);
+    drop(clear_hook);
 
     // Unpack outer archive (one `{uuid}.tar` per segment) and restore each segment in place.
     let unpacked = Builder::new()
         .prefix("unpacked_snapshot")
         .tempdir()
         .unwrap();
-    {
-        let mut archive = tar::Archive::new(File::open(snapshot_file.path()).unwrap());
-        archive.unpack(unpacked.path()).unwrap();
-    }
+    common::tar_unpack::tar_unpack_file(snapshot_file.path(), unpacked.path()).unwrap();
 
     let mut restored_point_ids = HashSet::new();
     for entry in fs_err::read_dir(unpacked.path()).unwrap() {
