@@ -104,17 +104,17 @@ impl SnapshotEntry for Segment {
                     let tar = tar.descend(Path::new(SNAPSHOT_PATH))?;
                     match exclude_pending_logs {
                         Some(excludes) => {
-                            snapshot_files(self, temp_path, &tar, &include_if, excludes)
+                            snapshot_files(self, temp_path, &tar, include_if, excludes)
                         }
-                        None => snapshot_files(self, temp_path, &tar, &include_if, &HashSet::new()),
+                        None => snapshot_files(self, temp_path, &tar, include_if, &HashSet::new()),
                     }
                 })??;
             }
             SnapshotFormat::Streamable => {
                 let tar = tar.descend(Path::new(&segment_id.to_string()))?;
                 match exclude_pending_logs {
-                    Some(excludes) => snapshot_files(self, temp_path, &tar, &include_if, excludes)?,
-                    None => snapshot_files(self, temp_path, &tar, &include_if, &HashSet::new())?,
+                    Some(excludes) => snapshot_files(self, temp_path, &tar, include_if, excludes)?,
+                    None => snapshot_files(self, temp_path, &tar, include_if, &HashSet::new())?,
                 }
             }
         }

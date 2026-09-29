@@ -464,7 +464,7 @@ fn test_snapshot_excludes_active_proxy_pending_logs_after_concurrent_cow() {
     let segment = build_segment_1(dir.path());
     let segment_path = segment.segment_path.clone();
     let point_ids: Vec<PointIdType> = (1..=5).map(u64::into).collect();
-    // Odd IDs mimic the crasher set_payload pattern (mutate every other point).
+    // Odd IDs mimic the chaos-test set_payload pattern (mutate every other point).
     let cow_point_ids: Vec<PointIdType> = [1u64, 3, 5].into_iter().map(Into::into).collect();
 
     let mut holder = SegmentHolder::default();
