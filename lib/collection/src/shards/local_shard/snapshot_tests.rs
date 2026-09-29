@@ -529,7 +529,10 @@ fn test_snapshot_excludes_active_proxy_pending_logs_after_concurrent_cow() {
     drop(_clear_hook);
 
     // Unpack outer archive (one `{uuid}.tar` per segment) and restore each segment in place.
-    let unpacked = Builder::new().prefix("unpacked_snapshot").tempdir().unwrap();
+    let unpacked = Builder::new()
+        .prefix("unpacked_snapshot")
+        .tempdir()
+        .unwrap();
     {
         let mut archive = tar::Archive::new(File::open(snapshot_file.path()).unwrap());
         archive.unpack(unpacked.path()).unwrap();
