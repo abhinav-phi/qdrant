@@ -433,3 +433,153 @@ async fn test_wal_ack_pin_at_zero_does_not_suppress_clock_persistence() {
         "a WAL acknowledge pin must hold back the acknowledge only, not clock persistence",
     );
 }
+
+/// Concurrent updates while a collection snapshot runs persist deletes into active snapshot-proxy
+/// pending logs (CoW `set_payload` does the same: delete half in the proxy log, upsert only in the
+/// shared write segment which is not archived). Those active-proxy logs must not be packed with
+/// the wrapped segments — restoring would replay the deletes and drop the points. With
+/// `persist_proxy_segments`, WAL (pinned during create) covers the in-flight ops instead.
+#[test]
+fn test_snapshot_excludes_active_proxy_pending_logs_after_concurrent_cow() {
+    use std::sync::atomic::AtomicBool;
+
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use common::types::DeferredBehavior;
+    use segment::entry::NonAppendableSegmentEntry as _;
+    use segment::pending_changes::{
+        PersistedProxyChanges, list_pending_changes_log_files, recover_pending_changes,
+    };
+    use segment::segment::Segment;
+    use segment::segment_constructor::load_segment;
+    use segment::types::{PointIdType, SeqNumberType};
+    use shard::locked_segment::LockedSegment;
+    use shard::segment_holder::FlushMode;
+    use uuid::Uuid;
+
+    use crate::shards::local_shard::snapshot::set_after_snapshot_proxy_flush_hook;
+
+    init_test_feature_flags();
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let segment = build_segment_1(dir.path());
+    let segment_path = segment.segment_path.clone();
+    let point_ids: Vec<PointIdType> = (1..=5).map(u64::into).collect();
+    // Odd IDs mimic the crasher set_payload pattern (mutate every other point).
+    let cow_point_ids: Vec<PointIdType> = [1u64, 3, 5].into_iter().map(Into::into).collect();
+
+    let mut holder = SegmentHolder::default();
+    holder.add_new(segment);
+    let holder = LockedSegmentHolder::new(holder);
+
+    let holder_for_hook = holder.clone();
+    set_after_snapshot_proxy_flush_hook(Some(Box::new(move || {
+        // Same persistence shape as CoW under snapshot proxies: deletes land in the active proxy
+        // pending log. (Full set_payload also upserts into the shared write segment, which is
+        // never archived by snapshot_all_segments — packing the deletes alone is what drops points.)
+        let hw_counter = HardwareCounterCell::new();
+        let segments = holder_for_hook.read();
+        let op_num: SeqNumberType = 100;
+        for &point_id in &cow_point_ids {
+            for (_, locked) in segments.iter() {
+                if let LockedSegment::Proxy(proxy) = locked {
+                    proxy
+                        .write()
+                        .delete_point(op_num, point_id, &hw_counter)
+                        .unwrap();
+                }
+            }
+        }
+        segments.flush_all(FlushMode::Sync, true).unwrap();
+        assert!(
+            !list_pending_changes_log_files(&segment_path).is_empty(),
+            "setup: concurrent deletes must land in the active proxy pending log",
+        );
+    })));
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            set_after_snapshot_proxy_flush_hook(None);
+        }
+    }
+    let _clear_hook = ClearHook;
+
+    let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
+    let snapshot_file = Builder::new().suffix(".snapshot.tar").tempfile().unwrap();
+    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(snapshot_file.path()).unwrap());
+
+    let payload_schema_file = dir.path().join("payload.schema");
+    let schema: Arc<SaveOnDisk<PayloadIndexSchema>> =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_schema_file).unwrap());
+
+    snapshot_all_segments(
+        holder.clone(),
+        segments_dir.path(),
+        None,
+        schema,
+        None,
+        temp_dir.path(),
+        &tar,
+        SnapshotFormat::Regular,
+        None,
+        None,
+    )
+    .unwrap();
+    tar.blocking_finish().unwrap();
+    drop(_clear_hook);
+
+    // Unpack outer archive (one `{uuid}.tar` per segment) and restore each segment in place.
+    let unpacked = Builder::new().prefix("unpacked_snapshot").tempdir().unwrap();
+    {
+        let mut archive = tar::Archive::new(File::open(snapshot_file.path()).unwrap());
+        archive.unpack(unpacked.path()).unwrap();
+    }
+
+    let mut restored_point_ids = HashSet::new();
+    for entry in fs_err::read_dir(unpacked.path()).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tar") {
+            continue;
+        }
+        Segment::restore_snapshot_in_place(&path).unwrap();
+        let segment_dir = path.with_extension("");
+        assert!(
+            segment_dir.is_dir(),
+            "restored segment directory {}",
+            segment_dir.display()
+        );
+
+        // Active proxy pending logs must not have been packed — only orphan logs (none here).
+        assert!(
+            list_pending_changes_log_files(&segment_dir).is_empty(),
+            "active snapshot-proxy pending logs must be excluded from the archive",
+        );
+
+        let mut restored = load_segment(
+            &segment_dir,
+            Uuid::nil(),
+            None,
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap();
+        recover_pending_changes(&mut restored, PersistedProxyChanges::Replay).unwrap();
+
+        for point_id in &point_ids {
+            if restored.has_point(*point_id, DeferredBehavior::VisibleOnly) {
+                restored_point_ids.insert(*point_id);
+            }
+        }
+    }
+
+    assert_eq!(
+        restored_point_ids.len(),
+        point_ids.len(),
+        "snapshot must keep pre-images of points deleted only in active proxy logs; missing {:?}",
+        point_ids
+            .iter()
+            .filter(|id| !restored_point_ids.contains(id))
+            .collect::<Vec<_>>(),
+    );
+}

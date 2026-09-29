@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use common::tar_ext;
@@ -20,14 +21,18 @@ impl SnapshotEntry for ProxySegment {
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
         manifest: Option<&SegmentManifest>,
+        exclude_pending_logs: Option<&HashSet<PathBuf>>,
     ) -> OperationResult<()> {
         log::info!("Taking a snapshot of a proxy segment");
 
         // Snapshot wrapped segment data into the temporary dir
-        self.wrapped_segment
-            .get()
-            .read()
-            .take_snapshot(temp_path, tar, format, manifest)?;
+        self.wrapped_segment.get().read().take_snapshot(
+            temp_path,
+            tar,
+            format,
+            manifest,
+            exclude_pending_logs,
+        )?;
 
         Ok(())
     }

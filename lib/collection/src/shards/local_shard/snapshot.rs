@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +30,27 @@ use wal::{Wal, WalOptions};
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::local_shard::{LocalShard, LocalShardClocks};
 use crate::update_workers::applied_seq::AppliedSeqHandler;
+
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static AFTER_SNAPSHOT_PROXY_FLUSH_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
+        const { RefCell::new(None) };
+}
+
+/// Test hook run after snapshot proxies are installed and flushed, before wrapped segments are
+/// packed. Stands in for concurrent CoW updates that persist into active proxy pending logs.
+#[cfg(test)]
+pub(crate) fn set_after_snapshot_proxy_flush_hook(hook: Option<Box<dyn FnMut()>>) {
+    AFTER_SNAPSHOT_PROXY_FLUSH_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+fn run_after_snapshot_proxy_flush_hook() {
+    AFTER_SNAPSHOT_PROXY_FLUSH_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
 
 impl LocalShard {
     pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
@@ -380,7 +403,7 @@ pub fn snapshot_all_segments(
         segment_config,
         payload_index_schema,
         deferred_internal_id,
-        |segment| {
+        |segment, exclude_pending_logs| {
             let read_segment = segment.read();
             let request_segment_manifest = if let Some(manifest) = manifest {
                 let segment_id = read_segment.segment_id()?;
@@ -394,7 +417,18 @@ pub fn snapshot_all_segments(
                 None
             };
             let segment_manifest_ref = request_segment_manifest.as_deref();
-            read_segment.take_snapshot(temp_dir, tar, format, segment_manifest_ref)?;
+            // Exclude pending-change logs owned by the active snapshot proxies. Concurrent CoW
+            // updates flush delete halves into those logs while upserts live only in the shared
+            // write segment (not archived here). Packing the deletes would drop points on restore;
+            // WAL (pinned during create) or the frozen wrapped pre-image covers those ops instead.
+            // Orphan logs under the segment dir are still packed.
+            read_segment.take_snapshot(
+                temp_dir,
+                tar,
+                format,
+                segment_manifest_ref,
+                Some(exclude_pending_logs),
+            )?;
             Ok(())
         },
     )
@@ -407,7 +441,9 @@ pub fn snapshot_all_segments(
 /// significant amount of time.
 ///
 /// This calls function `f` on all segments, but each segment is temporarily proxified while
-/// the function is called.
+/// the function is called. `f` also receives the set of pending-changes log paths owned by the
+/// *active* snapshot proxies: snapshotting must not pack those logs (see
+/// [`snapshot_all_segments`]).
 ///
 /// All segments are proxified at the same time on start. That ensures each wrapped (proxied)
 /// segment is kept at the same point in time. Each segment is unproxied one by one, right
@@ -424,7 +460,9 @@ pub fn snapshot_all_segments(
 /// It is recommended to provide collection parameters. The segment configuration will be
 /// sourced from it.
 ///
-/// Before snapshotting all segments are forcefully flushed to ensure all data is persisted.
+/// Before snapshotting, all segments are forcefully flushed so wrapped segment *files* match a
+/// consistent waterline. Concurrent updates after that flush can still append to active proxy
+/// pending-change logs; those must not be treated as frozen wrapped state.
 pub fn proxy_all_segments_and_apply<F>(
     segments: LockedSegmentHolder,
     applied_up_to: Option<SeqNumberType>,
@@ -435,7 +473,7 @@ pub fn proxy_all_segments_and_apply<F>(
     mut operation: F,
 ) -> OperationResult<()>
 where
-    F: FnMut(&RwLock<dyn StorageSegmentEntry>) -> OperationResult<()>,
+    F: FnMut(&RwLock<dyn StorageSegmentEntry>, &HashSet<PathBuf>) -> OperationResult<()>,
 {
     let segments_lock = segments.upgradable_read();
 
@@ -450,8 +488,23 @@ where
         deferred_internal_id,
     )?;
 
-    // Flush all pending changes of each segment, now wrapped segments won't change anymore
+    // Pending-change logs owned by these snapshot proxies. Concurrent CoW after the flush below
+    // may persist deletes here; the matching upserts live only in the shared write segment.
+    let active_proxy_pending_logs: HashSet<PathBuf> = proxies
+        .iter()
+        .filter_map(|(_, locked)| match locked {
+            LockedSegment::Proxy(proxy) => {
+                Some(proxy.read().pending_changes_log_path().to_path_buf())
+            }
+            LockedSegment::Original(_) => None,
+        })
+        .collect();
+
+    // Flush so wrapped segment files are durable at this waterline. Active proxy pending logs
+    // may still grow from concurrent updates and must not be packed into the snapshot.
     segments_lock.flush_all_up_to(FlushMode::Sync, true, applied_up_to)?;
+
+    run_after_snapshot_proxy_flush_hook();
 
     // Apply provided function
     log::trace!("Applying function on all proxied shard segments");
@@ -466,7 +519,7 @@ where
             LockedSegment::Proxy(proxy_segment) => {
                 let wrapped_segment = proxy_segment.read().wrapped_segment.clone();
                 let segment = wrapped_segment.get();
-                operation(segment)
+                operation(segment, &active_proxy_pending_logs)
             }
             // All segments to snapshot should be proxy, warn if this is not the case
             LockedSegment::Original(segment) => {
@@ -475,7 +528,7 @@ where
                     "Reached non-proxy segment while applying function to proxies, this should not happen, ignoring",
                 );
                 // Call provided function on segment
-                operation(segment.as_ref())
+                operation(segment.as_ref(), &active_proxy_pending_logs)
             }
         };
 
